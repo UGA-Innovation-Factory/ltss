@@ -15,6 +15,8 @@ from sqlalchemy import exc, create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from concurrent.futures import ThreadPoolExecutor
+
 import psycopg2
 
 from homeassistant.const import (
@@ -48,6 +50,7 @@ DOMAIN = "ltss"
 
 CONF_DB_URL = "db_url"
 CONF_CHUNK_TIME_INTERVAL = "chunk_time_interval"
+CONF_COMMIT_INTERVAL = "commit_interval"
 
 CONNECT_RETRY_WAIT = 3
 
@@ -57,8 +60,9 @@ CONFIG_SCHEMA = vol.Schema(
             {
                 vol.Required(CONF_DB_URL): cv.string,
                 vol.Optional(
-                    CONF_CHUNK_TIME_INTERVAL, default=2592000000000
+                    CONF_CHUNK_TIME_INTERVAL, default=2592000000000  # type: ignore
                 ): cv.positive_int,  # 30 days
+                vol.Optional(CONF_COMMIT_INTERVAL, default=0): cv.positive_float,
             }
         )
     },
@@ -72,12 +76,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     db_url = conf.get(CONF_DB_URL)
     chunk_time_interval = conf.get(CONF_CHUNK_TIME_INTERVAL)
+    commit_interval = conf.get(CONF_COMMIT_INTERVAL)
     entity_filter = convert_include_exclude_filter(conf)
 
     instance = LTSS_DB(
         hass=hass,
         uri=db_url,
         chunk_time_interval=chunk_time_interval,
+        commit_interval=commit_interval,
         entity_filter=entity_filter,
     )
     instance.async_initialize()
@@ -94,6 +100,7 @@ class LTSS_DB(threading.Thread):
         hass: HomeAssistant,
         uri: str,
         chunk_time_interval: int,
+        commit_interval: float,
         entity_filter: Callable[[str], bool],
     ) -> None:
         """Initialize the ltss."""
@@ -104,6 +111,7 @@ class LTSS_DB(threading.Thread):
         self.recording_start = dt_util.utcnow()
         self.db_url = uri
         self.chunk_time_interval = chunk_time_interval
+        self.commit_interval = commit_interval
         self.async_db_ready = asyncio.Future()
         self.engine: Any = None
         self.run_info: Any = None
@@ -111,6 +119,8 @@ class LTSS_DB(threading.Thread):
         self.entity_filter = entity_filter
 
         self.get_session = None
+
+        self.executor = ThreadPoolExecutor(max_workers=10)
 
     @callback
     def async_initialize(self):
@@ -189,22 +199,42 @@ class LTSS_DB(threading.Thread):
         if result is shutdown_task:
             return
 
-        while True:
-            event = self.queue.get()
+        if self.commit_interval == 0:
+            while True:
+                event = self.queue.get()
 
-            if event is None:
-                self._close_connection()
-                self.queue.task_done()
-                return
+                if event is None:
+                    self._close_connection()
+                    self.queue.task_done()
+                    break
 
-            tries = 1
-            updated = False
-            while not updated and tries <= 10:
-                if tries != 1:
-                    time.sleep(CONNECT_RETRY_WAIT)
-                try:
-                    with self.get_session() as session:
-                        with session.begin():
+                self.executor.submit(self._process_event_single, event)
+        else:
+            while True:
+                time.sleep(self.commit_interval)
+                events = []
+                num_events = self.queue.qsize()
+                for _ in range(num_events):
+                    event = self.queue.get()
+                    if event is None:
+                        self._close_connection()
+                        self.queue.task_done()
+                        break
+                    events.append(event)
+                self.executor.submit(self._process_event_bulk, events)
+
+        self.executor.shutdown(wait=True)
+
+    def _process_event_bulk(self, events):
+        tries = 1
+        updated = False
+        while not updated and tries <= 10:
+            if tries != 1:
+                time.sleep(CONNECT_RETRY_WAIT)
+            try:
+                with self.get_session() as session:  # type: ignore
+                    with session.begin():
+                        for event in events:
                             try:
                                 row = LTSS.from_event(event)
                                 session.add(row)
@@ -214,29 +244,31 @@ class LTSS_DB(threading.Thread):
                                     event.data.get("new_state"),
                                 )
 
-                        updated = True
-
-                except exc.OperationalError as err:
-                    _LOGGER.error(
-                        "Error in database connectivity: %s. "
-                        "(retrying in %s seconds)",
-                        err,
-                        CONNECT_RETRY_WAIT,
-                    )
-                    tries += 1
-
-                except exc.SQLAlchemyError:
                     updated = True
-                    _LOGGER.exception("Error saving event: %s", event)
 
-            if not updated:
+            except exc.OperationalError as err:
                 _LOGGER.error(
-                    "Error in database update. Could not save "
-                    "after %d tries. Giving up",
-                    tries,
+                    "Error in database connectivity: %s. " "(retrying in %s seconds)",
+                    err,
+                    CONNECT_RETRY_WAIT,
                 )
+                tries += 1
 
+            except exc.SQLAlchemyError:
+                updated = True
+                _LOGGER.exception("Error saving events: %s", events)
+
+        if not updated:
+            _LOGGER.error(
+                "Error in database update. Could not save " "after %d tries. Giving up",
+                tries,
+            )
+
+        for _ in events:
             self.queue.task_done()
+
+    def _process_event_single(self, event):
+        return self._process_event_bulk([event])
 
     @callback
     def event_listener(self, event):
